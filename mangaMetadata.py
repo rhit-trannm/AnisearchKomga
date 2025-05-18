@@ -1,524 +1,288 @@
 import requests, json, time, sys, os
+from urllib.parse import urlparse
 
-from io import StringIO, BytesIO
-
-from lxml import etree
-from lxml.etree import ParserError
-
-
-
-from playwright.sync_api import sync_playwright
-
-langs = ["German", "English", "Spanish", "French", "Italian", "Japanese"]
-
-try:
-    ENV_URL = os.environ['KOMGAURL']
-except:
-    ENV_URL = ""
-try:
-    ENV_EMAIL = os.environ['KOMGAEMAIL']
-except:
-    ENV_EMAIL = ""
-try:
-    ENV_PASS = os.environ['KOMGAPASSWORD']
-except:
-    ENV_PASS = ""
-try:
-    ENV_LANG = os.environ['LANGUAGE']
-except:
-    ENV_LANG = ""
-try:
-    ENV_MANGAS = os.environ['MANGAS']
-except:
-    ENV_MANGAS = "NONE"
-try:
-    ENV_PROGRESS = os.environ['KEEPPROGRESS']
-    if(ENV_PROGRESS.lower() == "true"):
-        ENV_PROGRESS = True
-    else:
-        ENV_PROGRESS = False
-except:
-    ENV_PROGRESS = False
-
-
-if (ENV_URL == "" and ENV_EMAIL == "" and ENV_PASS == "" and ENV_LANG == ""):
-    try:
-        from config import *
-    except ImportError:
-        print("Failed to find config.py, does it exist?")
-        sys.exit(1)
-elif (ENV_URL != "" and ENV_EMAIL != "" and ENV_PASS != "" and ENV_LANG != ""):
-    komgaurl = ENV_URL
-    komgaemail = ENV_EMAIL
-    komgapassword = ENV_PASS
-    anisearchlang = ENV_LANG
-    keepProgress = ENV_PROGRESS
-    mangas = []
-    if(ENV_MANGAS != "NONE"):
-        for manga in ENV_MANGAS.split(","):
-            if(manga[:1] == " "):
-                manga = manga[1:]
-            mangas.append(manga)
-else:
-    print("Looks like either you are trying to set the configuration using environment variables or you are using docker.")
-    if(ENV_URL == ""):
-        print("Missing Komga URL")
-    if(ENV_EMAIL == ""):
-        print("Missing Komga Email")
-    if(ENV_PASS == ""):
-        print("Missing Komga Password")
-    if(ENV_LANG == ""):
-        print("Missing Anisearch language")
-    sys.exit(1)
-
-if(anisearchlang not in langs):
-    print("Invalid language, select one listed the README")
-    sys.exit(1)
-
-
-def getBaseURL():
-    if(anisearchlang == "German"):
-        return "https://www.anisearch.de/"
-    if(anisearchlang == "English"):
-        return "https://www.anisearch.com/"
-    if(anisearchlang == "Spanish"):
-        return "https://www.anisearch.es/"
-    if(anisearchlang == "French"):
-        return "https://www.anisearch.fr/"
-    if(anisearchlang == "Italian"):
-        return "https://www.anisearch.it/"
-    if(anisearchlang == "Japanese"):
-        return "https://www.anisearch.jp/"
-
-def getFlagLanguage():
-    if(anisearchlang == "German"):
-        return "Deutsch"
-    if(anisearchlang == "English"):
-        return "English"
-    if(anisearchlang == "Spanish"):
-        return "Español"
-    if(anisearchlang == "French"):
-        return "Français"
-    if(anisearchlang == "Italian"):
-        return "Italiana"
-    if(anisearchlang == "Japanese"):
-        return "日本語"
-
-
-summarySourceLang = [" Quelle: ", " Quelle:", "Quelle:", " Source: ", " Source:", "Source:"]
-runningLang = ["Laufend", "Ongoing", "Corriente", "En cours", "In corso", "放送", "放送（連載）中"]
-abandonedLang = ["Abgebrochen", "Aborted", "Cancelado", "Annulé", "Abbandonato", "打ち切り"]
-endedLang = ["Abgeschlossen", "Completed", "Completado", "Terminé", "Completato", "完結"]
-tagTexts = ["Hauptgenres", "Main genres", "Género principal", "Principaux genres", "Generi principali", "メインジャンル"]
-noSummaryLang = ["Damit hilfst Du der gesamten deutschsprachigen Anime und Manga-Community", "We’re looking forward to your contributions", "Con esto ayudas a toda la comunidad de Anime y Manga", "Nous attendons avec impatience tes contributions", "Non vediamo l’ora di ricevere i tuoi contributi", "皆様からのご投稿をお待ちしております"]
-blurbLang = ["Klappentext", "Blurb", "Texto de presentación", "Texte du rabat", "Testo della bandella"]
+MAL_CACHE_FILE = "mal_links.json"
 
 class metadata:
     def __init__(self):
-            self.status = ""
-            self.summary = ""
-            self.publisher = ""
-#            self.agerating = ""
-            self.genres = "[]"
-            self.tags = "[]"
-            self.isvalid = False
+        self.status = ""
+        self.summary = ""
+        self.publisher = ""
+        self.genres = "[]"
+        self.tags = "[]"
+        self.cover_url = ""
+        self.mal_url = ""
+        self.isvalid = False
 
-def getURLfromSearch(query):
-    url = getBaseURL() + "manga/index?text=" + query + "&smode=1&sort=voter&order=desc&quick-search=&char=all&q=true"
+def load_mal_cache():
+    if os.path.exists(MAL_CACHE_FILE):
+        with open(MAL_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
+def save_mal_cache(cache):
+    with open(MAL_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2)
 
-    resp = page.goto(url)
-    content = page.content()
-    new_url = resp.url
-    status_code = resp.status
+def promptMangaSelection(results):
+    print("\nSelect a manga:")
+    for i, manga in enumerate(results[:3]):
+        print(f"[{i+1}] {manga['title']} ({manga.get('status', 'Unknown')}) - {manga.get('url')}")
+    print("[4] Enter your own MAL link")
+    print("[0] Skip this entry")
 
-    if("quick-search=" not in new_url):
-        print("Got instant redirect, correct series found")
-        return new_url
-
-    if(status_code != 200):
-        print("Status code was " + str(status_code) + ", so skipping...")
-        if(status_code == 403):
-            print(content)
-        return ""
-
-    try:
-        parser = etree.HTMLParser()
-        html_dom = etree.HTML(content, parser)
-    except ParserError as e:
-        print(e)
-    try:
-        manga_url = html_dom.xpath("//*[@id=\"content-inner\"]/ul[2]/li[1]/a/@href")[0]
-        return getBaseURL() + manga_url
-    except:
-        return ""
-
-#out = open("out.txt", "w", encoding='utf-8')
-#out.write(tree.tostring(tree.getroot()).content.decode(sys.stdout.encoding, errors='replace'))
-#out.close()
-
-#print(getURLfromSearch("adekan"))
-
-def getMangaMetadata(query):
-    print("Getting metadata for " + str(query))
-    status = ""         #done
-    summary = ""        #done
-    publisher = ""      #done
-#    agerating = ""
-    genres = "[]"
-    tags = "[]"
-
-    data = metadata()
-
-    URL = getURLfromSearch(query)
-    if(URL == ""):
-        print("No result found or error occured")
-        return data
-
-    time.sleep(1)
-
-    resp = page.goto(URL)
-    content = page.content()
-    status_code = resp.status
-
-    if(status_code != 200):
-        print("return code was " + str(status_code) + ", skipping...")
-        return data
-    try:
-        parser = etree.HTMLParser()
-        html_dom = etree.HTML(content, parser)
-    except ParserError as e:
-        print(e)
-        return data
-
-    #getLangIndex
-    index = 1
-    rightIndex = -1
-    langRunning = True
-    while(langRunning):
+    while True:
         try:
-            flag = html_dom.xpath("//*[@id=\"information\"]/div/ul/li[2]/ul/li[" + str(index) + "]/div[1]/img/@title")[0]
-            if(flag == getFlagLanguage()):
-                rightIndex = index
-                if (anisearchlang == "Japanese"):
-                    statusIndex = 3
-                    publisherIndex = 6
-                else:
-                    statusIndex = 2
-                    publisherIndex = 5
-#                print("Found correct Language, index is " + str(rightIndex))
-                langRunning = False
-                break
-            index += 1
-        except Exception as e:
-            langRunning = False
-            statusIndex = 3
-            publisherIndex = 6
-            break
+            choice = int(input("Enter number (0-4): ").strip())
+            if 0 <= choice <= 4:
+                return choice
+        except:
+            pass
+        print("Invalid input. Please enter 0, 1, 2, 3, or 4.")
 
-    if(rightIndex == -1):
-        print("Failed to find set language, using first language as fallback")
-        rightIndex = 1
-
-    rightIndex = str(rightIndex)
-
-    #getStatus
-    try:
-        status = html_dom.xpath("//*[@id=\"information\"]/div/ul/li[2]/ul/li[" + rightIndex + "]/div[" + str(statusIndex) + "]")[0].itertext()
-        status = ''.join(status).split(": ")[1]
-    except Exception as e:
+def getMangaMetadataFromMAL(query, cache):
+    if query in cache:
         try:
-            status = html_dom.xpath("//*[@id=\"information\"]/div/ul/li[2]/ul/li[1]/div[3]")[0].itertext()
-            status = ''.join(status).split(": ")[1]
-        except Exception as e:
-            print(e)
-            print("Failed to get status")
+            mal_id = int(urlparse(cache[query]).path.strip("/").split("/")[1])
+            print(f"🔁 Using cached MAL link for {query}: {cache[query]}")
+            return getMetadataFromMALId(mal_id), True  # Added `from_cache = True`
+        except:
+            print("⚠️ Invalid cached MAL link. Proceeding with fresh search.")
 
-    if(status != ""):
-        if(status in runningLang):
-            casestatus = "\"ONGOING\""
-        elif(status in abandonedLang):
-            casestatus = "\"ABANDONED\""
-        elif(status in endedLang):
-            casestatus = "\"ENDED\""
-        else:
-            casestatus = "\"ENDED\""
-                
-            
-        data.status = casestatus
+    print(f"Searching MAL for: {query}")
+    url = f"https://api.jikan.moe/v4/manga?q={query}&limit=5&type=manga"
+    resp = requests.get(url)
 
+    if resp.status_code != 200:
+        print(f"Jikan request failed with status {resp.status_code}")
+        return None, False
 
-    #getSummary
-    try:
-        summary = html_dom.xpath("//*[@id=\"description\"]/div/div/div[1]")[0].itertext()
-        summary = ''.join(summary)
-        for t in tagTexts:
-            if(t in summary):
-                raise Exception
-        for s in noSummaryLang:
-            if(s in summary):
-                raise Exception
-    except Exception as e:
-        engsum = ""
-        langsum = ""
-        sumindex = 1
-        noavail = False
-        while(True):
-            try:
-                summary = html_dom.xpath("//*[@id=\"description\"]/div/div/section/div[" + str(sumindex) + "]")[0].itertext()
-                summary = ''.join(summary)
-                sumlang = html_dom.xpath("//*[@id=\"description\"]/div/div/section/button[" + str(sumindex) + "]")[0].itertext()
-                sumlang = ''.join(sumlang)
-                for s in noSummaryLang:
-                    if (s in summary):
-                        print("No summary available for this language")
-                        noavail = True
-                        continue
-                if (sumlang == getFlagLanguage() and noavail == False):
-                    langsum = summary
-                    break
-                elif (sumlang == "English"):
-                    engsum = summary
-                    if(noavail):
-                        break
-                sumindex += 1
-            except Exception as e:
-                break
+    data = resp.json()
+    if "data" not in data or len(data["data"]) == 0:
+        print("No results found on MAL.")
+        return None, False
 
-        if(langsum != ""):
-            summary = langsum
-        else:
-            summary = engsum
-    if(summary != ""):
-        for b in blurbLang:
-            if(b in summary.split(":")[0]):
-                summary = summary[len(b):]
-
-        summarylist = summary.split(":")[:-1]
-        summary = ""
-        for s in summarylist:
-            summary += s
-            summary += ":"
-
-        if(summary[0:1] == ":"):
-            summary = summary[1:]
-
-        for sou in summarySourceLang:
-            l = len(sou)
-            if(summary[len(summary)-l:] == sou):
-                summary = summary[:len(summary) - l]
-                break
-
-        data.summary = summary
-
-
-    #getPublisher
-    try:
-        publisher = html_dom.xpath("//*[@id=\"information\"]/div/ul/li[2]/ul/li[" + rightIndex + "]/div[" + str(publisherIndex) + "]")[0].itertext()
-        publisher = ''.join(publisher)
-    except Exception as e:
+    choice = promptMangaSelection(data["data"])
+    if choice == 0:
+        return None, False
+    elif choice == 4:
+        user_url = input("Paste your MAL manga URL: ").strip()
         try:
-            publisher = html_dom.xpath("//*[@id=\"information\"]/div/ul/li[2]/ul/li[1]/div[6]")[0].itertext()
-            publisher = ''.join(publisher)
-        except Exception as e:
-            print(e)
-            print("Failed to get publisher")
-    if(publisher != ""):
-        publisher = publisher.split(": ")[1]
-        data.publisher = publisher
-
-    #Tags & Genres
-    i = 1
-    running = True
-    genrelist = []
-    taglist = []
-    while(running):
-        try:
-            tag = html_dom.xpath("//*[@id=\"description\"]/div/div/ul/li[" + str(i) + "]")[0]
-            tagstring = ''.join(tag.itertext())
+            mal_id = int(urlparse(user_url).path.strip("/").split("/")[1])
+            cache[query] = user_url
+            save_mal_cache(cache)
+            return getMetadataFromMALId(mal_id), True
+        except:
+            print("Invalid URL or ID. Skipping.")
+            return None, False
+    else:
+        selected = data["data"][choice - 1]
+        cache[query] = selected["url"]
+        save_mal_cache(cache)
+        return parseMangaToMetadata(selected), False
 
 
-            tagurl = html_dom.xpath("//*[@id=\"description\"]/div/div/ul/li[" + str(i) + "]/a/@href")[0]
-            if("/genre/" in tagurl):
-                if(tagstring not in genrelist):
-                    genrelist.append(tagstring)
-            else:
-                if(tagstring not in taglist):
-                    taglist.append(tagstring)
-            i += 1
-        except Exception as e:
-#            print(e)
-            running = False
+def getMetadataFromMALId(mal_id):
+    url = f"https://api.jikan.moe/v4/manga/{mal_id}"
+    resp = requests.get(url)
+    if resp.status_code != 200:
+        print(f"Failed to fetch by ID. Status: {resp.status_code}")
+        return None
+    data = resp.json()
+    if "data" not in data:
+        return None
+    return parseMangaToMetadata(data["data"])
 
-    if(len(genrelist) > 0):
-        genres = "["
-        for idx, genre in enumerate(genrelist):
-            if(idx != 0):
-                genres += ",\n"
-            genres += "\"" + genre + "\""
-        genres += "]"
+def parseMangaToMetadata(manga):
+    md = metadata()
+    score = manga.get("score")
+    summary = (manga.get("synopsis") or "").replace('\n', ' ').replace('"', '\\"')
+    if score:
+        summary = f"⭐ {score}\n{summary}"
+    md.summary = summary
 
-        data.genres = genres
+    md.publisher = manga.get("serializations", [{}])[0].get("name", "")
+    md.cover_url = manga.get("images", {}).get("jpg", {}).get("large_image_url", "")
+    md.mal_url = manga.get("url", "")
 
-    if(len(taglist) > 0):
-        tags = "["
-        for idx, tag in enumerate(taglist):
-            if(idx != 0):
-                tags += ",\n"
-            tags += "\"" + tag + "\""
-        tags += "]"
+    status = manga.get("status", "").lower()
+    if "publishing" in status:
+        md.status = "\"ONGOING\""
+    elif "finished" in status:
+        md.status = "\"ENDED\""
+    else:
+        md.status = "\"ABANDONED\""
 
-        data.tags = tags
+    genres = [g["name"] for g in manga.get("genres", [])]
+    md.genres = json.dumps(genres)
 
-    data.isvalid = True
-    return data
+    themes = [t["name"] for t in manga.get("themes", [])]
+    md.tags = json.dumps(themes)
 
-p_context = sync_playwright()
-p = p_context.__enter__()
-browser = p.chromium.launch()
-page = browser.new_page()
-page.goto(getBaseURL())
+    md.isvalid = True
+    return md
 
-
-print("Using user " + komgaemail)
-
-x = requests.get(komgaurl + '/api/v1/series?size=50000', auth = (komgaemail, komgapassword))
-
-json_string = json.loads(x.text)
-
-seriesnum = 0
+# Config load
 try:
-    expected = json_string['numberOfElements']
+    ENV_URL = os.environ['KOMGAURL']
+    ENV_EMAIL = os.environ['KOMGAEMAIL']
+    ENV_PASS = os.environ['KOMGAPASSWORD']
+    ENV_PROGRESS = os.environ['KEEPPROGRESS'].lower() == "true"
+    ENV_MANGAS = os.environ.get('MANGAS', "")
+    mangas = [m.strip() for m in ENV_MANGAS.split(",")] if ENV_MANGAS else []
+    komgaurl, komgaemail, komgapassword, keepProgress = ENV_URL, ENV_EMAIL, ENV_PASS, ENV_PROGRESS
 except:
-    print("Failed to get list of mangas, are the login infos correct?")
+    try:
+        from config import komgaurl, komgaemail, komgapassword, keepProgress, mangas
+    except ImportError:
+        print("❌ Failed to find config.py.")
+        sys.exit(1)
+
+print(f"🔐 Using user {komgaemail}")
+x = requests.get(f"{komgaurl}/api/v1/series?size=50000", auth=(komgaemail, komgapassword))
+try:
+    series_data = x.json()
+    expected = series_data['numberOfElements']
+except:
+    print("❌ Failed to get series list.")
     sys.exit(1)
 
-print("Series to do: ")
-print(expected)
+print(f"📚 Series to update: {expected}")
 
-class failedtries():
+progressfilename = "mangas.progress"
+progresslist = []
+if keepProgress:
+    try:
+        with open(progressfilename) as f:
+            progresslist = [line.strip() for line in f.readlines()]
+    except:
+        print("⚠️ No progress file found. Starting fresh.")
+
+mal_cache = load_mal_cache()
+
+class FailedTry:
     def __init__(self, id, name):
         self.id = id
         self.name = name
 
 failed = []
 
-progressfilename = "mangas.progress"
-
 def addMangaProgress(seriesID):
-    if(keepProgress == False):
+    if keepProgress:
+        with open(progressfilename, "a") as f:
+            f.write(f"{seriesID}\n")
+
+def updateCover(seriesID, md):
+    if not md.cover_url:
         return
-    progfile = open(progressfilename, "a+")
-    progfile.write(str(seriesID) + "\n")
-    progfile.close()
-
-
-progresslist = []
-if(keepProgress):
-    print("Loading list of successfully updated mangas")
     try:
-        with open(progressfilename) as file:
-            progresslist = [line.rstrip() for line in file]
-    except:
-        print("Failed to load list of mangas")
+        cover_resp = requests.get(md.cover_url)
+        if cover_resp.status_code != 200:
+            print("⚠️ Failed to download cover.")
+            return
+        files = {'file': ('cover.jpg', cover_resp.content, 'image/jpeg')}
+        response = requests.post(
+            f"{komgaurl}/api/v1/series/{seriesID}/thumbnails",
+            auth=(komgaemail, komgapassword),
+            files=files
+        )
+        if response.status_code == 200:
+            print("🖼️ Cover updated.")
+        else:
+            print(f"⚠️ Cover update failed. Status: {response.status_code}")
+    except Exception as e:
+        print("⚠️ Cover upload error:", e)
 
-failedfile = open("failed.txt", "w")
-for series in json_string['content']:
-    seriesnum += 1
-    if(len(mangas) > 0):
-        if(series['name'] not in mangas):
-            continue
-    print("Number: " + str(seriesnum) + "/" + str(expected))
-    name = series['name']
+# Main update loop
+for idx, series in enumerate(series_data['content']):
+    print(f"\n[{idx+1}/{expected}] {series['name']}")
     seriesID = series['id']
-    if(str(seriesID) in progresslist):
-        print("Manga " + str(name) + " was already updated, skipping...")
+    if mangas and series['name'] not in mangas:
         continue
-    print("Updating: " + str(name))
-    md = getMangaMetadata(name)
-    if(md.isvalid == False):
-        print("----------------------------------------------------")
-        print("Failed to update " + str(name) + ", trying again at the end")
-        print("----------------------------------------------------")
-        fail = failedtries(seriesID, name)
-        failed.append(fail)
-        failedfile.write(str(seriesID))
-        failedfile.write(name)
-        time.sleep(10)
+
+    md, from_cache = getMangaMetadataFromMAL(series['name'], mal_cache)
+    if not md or not md.isvalid:
+        print("❌ No valid metadata.")
+        failed.append(FailedTry(seriesID, series['name']))
         continue
-    jsondata = """{
-  "status": %s,
-  "statusLock": true,
-  "summary": "%s",
-  "summaryLock": true,
-  "publisher": "%s",
-  "publisherLock": true,
-  "genres": %s,
-  "genresLock": true,
-  "tags": %s,
-  "tagsLock": true
-}""" % (md.status, md.summary.replace('\n', '\\n'), md.publisher, md.genres, md.tags)
-#% (md.status, md.summary.encode('ascii', 'ignore').decode("utf-8").replace('\n', '\\n'), md.publisher, md.genres, md.tags)
-    pushdata = jsondata.replace("\n", "").replace("{  \\\"status\\\": ", "{\\\"status\\\":").replace(",  \\\"statusLock\\\": ", ",\\\"statusLock\\\":").replace(",  \\\"summary\\\": ", ",\\\"summary\\\":").replace(",  \\\"summaryLock\\\": ", ",\\\"summaryLock\\\":").replace("\n", "").replace("\r", "")
-    print(pushdata)
-    headers = {'Content-Type': 'application/json', 'accept': '*/*'}
-    patch = requests.patch(komgaurl + "/api/v1/series/" + seriesID + "/metadata", data=str.encode(pushdata), auth = (komgaemail, komgapassword), headers=headers)
-    if(patch.status_code == 204):
-        print("----------------------------------------------------")
-        print("Successfully updated " + str(name))
-        print("----------------------------------------------------")
-        addMangaProgress(seriesID)
-        time.sleep(10)
+
+    print("📄 Metadata preview:")
+    print(f"Status: {md.status}")
+    print(f"Summary: {md.summary[:200]}...")
+    print(f"Publisher: {md.publisher}")
+    print(f"Genres: {md.genres}")
+    print(f"Tags: {md.tags}")
+    print(f"🔗 MAL Link: {md.mal_url}")
+
+    if not from_cache:
+        confirm = input("Use this metadata? (y/n): ").strip().lower()
+        if confirm != 'y':
+            print("⏭️ Skipped.")
+            continue
     else:
-        try:
-            print("----------------------------------------------------")
-            print("Failed to update " + str(name) + ", trying again at the end")
-            print("----------------------------------------------------")
-            print(patch)
-            print(patch.text)
-            failedfile.write(str(seriesID))
-            failedfile.write(name)
-            fail = failedtries(seriesID, name)
-            failed.append(fail)
-        except:
-            pass
+        print("✅ Using cached MAL metadata without prompt.")
 
-failedfile.close()
+    payload = {
+        "status": json.loads(md.status),
+        "statusLock": True,
+        "summary": md.summary,
+        "summaryLock": True,
+        "publisher": md.publisher,
+        "publisherLock": True,
+        "genres": json.loads(md.genres),
+        "genresLock": True,
+        "tags": json.loads(md.tags),
+        "tagsLock": True
+    }
 
+    response = requests.patch(
+        f"{komgaurl}/api/v1/series/{seriesID}/metadata",
+        headers={'Content-Type': 'application/json'},
+        auth=(komgaemail, komgapassword),
+        data=json.dumps(payload)
+    )
+
+    if response.status_code == 204:
+        print("✅ Metadata updated.")
+        addMangaProgress(seriesID)
+        updateCover(seriesID, md)
+    else:
+        print("❌ Metadata update failed.")
+        failed.append(FailedTry(seriesID, series['name']))
+    time.sleep(1)
+
+# Retry loop
+print("\n🔁 Retrying failed updates...")
 for f in failed:
-    md = getMangaMetadata(f.name)
-    if (md.isvalid == False):
-        print("----------------------------------------------------")
-        print("Failed again to update " + str(f.name) + ", not trying again")
-        print("----------------------------------------------------")
-        time.sleep(10)
+    md = getMangaMetadataFromMAL(f.name, mal_cache)
+    if not md or not md.isvalid:
+        print(f"❌ Still failed for {f.name}")
         continue
-    jsondata = """{
-      "status": %s,
-      "statusLock": true,
-      "summary": "%s",
-      "summaryLock": true,
-      "publisher": "%s",
-      "publisherLock": true,
-      "genres": %s,
-      "genresLock": true,
-      "tags": %s,
-      "tagsLock": true
-    }""" % (md.status, md.summary.replace('\n', '\\n'), md.publisher, md.genres, md.tags)
-    pushdata = jsondata.replace("\n", "").replace("{  \\\"status\\\": ", "{\\\"status\\\":").replace(",  \\\"statusLock\\\": ", ",\\\"statusLock\\\":").replace(",  \\\"summary\\\": ", ",\\\"summary\\\":").replace(",  \\\"summaryLock\\\": ", ",\\\"summaryLock\\\":").replace("\n", "").replace("\r", "")
-    print(pushdata)
-    headers = {'Content-Type': 'application/json', 'accept': '*/*'}
-    patch = requests.patch(komgaurl + "/api/v1/series/" + seriesID + "/metadata", data=str.encode(pushdata), auth = (komgaemail, komgapassword), headers=headers)
-    if(patch.status_code == 204):
-        print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
-        print("Successfully updated " + str(f.name))
-        print("++++++++++++++++++++++++++++++++++++++++++++++++++++")
-        addMangaProgress(seriesID)
-        time.sleep(10)
+
+    payload = {
+        "status": json.loads(md.status),
+        "statusLock": True,
+        "summary": md.summary,
+        "summaryLock": True,
+        "publisher": md.publisher,
+        "publisherLock": True,
+        "genres": json.loads(md.genres),
+        "genresLock": True,
+        "tags": json.loads(md.tags),
+        "tagsLock": True
+    }
+
+    response = requests.patch(
+        f"{komgaurl}/api/v1/series/{f.id}/metadata",
+        headers={'Content-Type': 'application/json'},
+        auth=(komgaemail, komgapassword),
+        data=json.dumps(payload)
+    )
+
+    if response.status_code == 204:
+        print(f"✅ Retry successful: {f.name}")
+        addMangaProgress(f.id)
+        updateCover(f.id, md)
     else:
-        print("----------------------------------------------------")
-        print("Failed again to update " + str(f.name) + ", not trying again")
-        print("----------------------------------------------------")
-        addMangaProgress(seriesID)
-        time.sleep(10)
-        continue
+        print(f"❌ Retry failed for {f.name}")
+    time.sleep(1)

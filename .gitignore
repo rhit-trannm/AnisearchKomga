@@ -5,3 +5,6 @@ __pycache__/
 .idea/
 mangas.progress
 mydocker-compose.yml
+/Komga
+config.template.py
+mal_links.json
